@@ -1,5 +1,9 @@
 
 
+//#define DISPLAY_OOTC
+#define DISPLAY_OOTC_DATA
+//#define DISPLAY_ANGLES
+
 #define RINGBUFF_MAX 200
 #define TICKS_PER_US 84 //84 ticks per microsecond
 
@@ -94,50 +98,63 @@ static bool lastPulseWasOotc = false;
 //      Serial.print("Falling ");
 //      Serial.println(ring1.buff[ring1.readerPos] & ~FALLING_EDGE);
 //      Serial.print(ring1.buff[ring1.readerPos] & ~FALLING_EDGE);
+//      Serial.print(", ");
 
       if (lastWasRising)
       {
         int durationTicks = ((lastTime - (ring1.buff[ring1.readerPos] & ~FALLING_EDGE))+ 83999)%83999;
-        float duration = durationTicks / 84.0;
+        float duration = durationTicks / 84.0; //the clock we're using has 84 ticks per us
 //        Serial.print(", ");
 //        Serial.println(duration);
         //Serial.println(" us");
 
-        float durationDecoded = duration / 10.41667;
 
+        // 10.416667 is a bit of a magic number  
+        // Derived from data at: 
+        // https://github.com/nairol/LighthouseRedox/blob/master/docs/Light%20Emissions.md
+        float durationDecoded = duration / 10.41667; 
         
-
         if (durationDecoded > 5.5 && durationDecoded < 14.5)
         {
 
             OotcPulseStartTime = lastTime;
            // okay, looks like a OOTX frame, let's decode it
            int pulseVal = (durationDecoded + 0.5); // add .5 so we round to the nearest instead of truncating
-            pulseVal -= 6;
-//            Serial.print(" 68/*69: ");
-//           Serial.print(durationDecoded);
-//            Serial.print(" pulseVal: ");
-//           Serial.print(pulseVal);
-//
+           pulseVal -= 6; // subtract 6 because the first value (0 index) starts at a pulse value of 6
 
-//           data = pulseVal & 0x01;
-//           rotor = pulseVal & 0x02;
-
-           // docs wrong?  The above appears wrong, replacing with this:
-           data = pulseVal & 0x02;
            rotor = pulseVal & 0x01;
-           
-           skip = pulseVal &0x04;
+           data =  pulseVal & 0x02;
+           skip =  pulseVal & 0x04;
 
-if (0)
-{
+#ifdef DISPLAY_OOTC
            Serial.print("  data: ");
            Serial.print(data);
            Serial.print("  rotor: ");
            Serial.print(rotor);
            Serial.print("  skip: ");
            Serial.println(skip);
-}
+#endif
+#ifdef DISPLAY_OOTC_DATA
+          static int zeroBitCount = 0;
+
+          Serial.print(data);
+
+          if (zeroBitCount == 17 && data == 1)
+          {
+            Serial.println("");
+          }
+
+          if (data == 1)
+          {
+            zeroBitCount = 0;
+          }
+          else
+          {
+            zeroBitCount++;
+          }
+
+#endif
+
            lastPulseWasOotc = true;
         }
 
@@ -153,7 +170,7 @@ if (0)
 //      Serial.print("R, ");
 //      Serial.print("Rising  ");
 //      Serial.print(ring1.buff[ring1.readerPos]);
-//      Serial.print(" ");
+//      Serial.print(", ");
 
       if (0)//(!lastWasRising)
       {
@@ -167,15 +184,27 @@ if (0)
       if (lastPulseWasOotc)
       {
           // This is the rising edge of our sweep pulse
-          int durationTicks = ((OotcPulseStartTime - (ring1.buff[ring1.readerPos]))+ 83999)%83999;
+          int durationTicks = ((OotcPulseStartTime - (ring1.buff[ring1.readerPos]))+ SysTick->LOAD)%SysTick->LOAD;
           float duration = durationTicks / 84.0;
 //          Serial.print("       angular_duration: ");
-          Serial.print(duration);
-          Serial.print(" us  ");
+//          Serial.print(duration);
+//          Serial.print(" us  ");
+
+#define CYCLES_PER_SECOND 60.0
+#define DEGREES_PER_CYCLE 360.0
+#define S_PER_MS (1.0/1000.0)
+#define CYCLES_PER_SECOND (1.0/60.0)
+
+#ifdef DISPLAY_ANGLES
+          Serial.print(duration * S_PER_MS * CYCLES_PER_SECOND * DEGREES_PER_CYCLE,4);
+          Serial.print("  ");
+//          Serial.print(" degrees  ");
+         
           if (rotor)
           {
             Serial.println("");
           }
+#endif 
        
           lastPulseWasOotc = false;
       }
@@ -238,6 +267,5 @@ void falling1()
     ring1.writerPos = (ring1.writerPos+1) % RINGBUFF_MAX;
   }
 }
-
 
 
