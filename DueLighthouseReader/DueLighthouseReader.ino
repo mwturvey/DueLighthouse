@@ -8,7 +8,7 @@
 //#define DISPLAY_RAW_SIGNAL_DURATIONS
 //#define DISPLAY_NEWLINE_AFTER_Y
 
-#define RINGBUFF_MAX 200
+#define RINGBUFF_MAX 1000
 #define TICKS_PER_US 84 //84 ticks per microsecond
 
 // the high order bit is used to indicate if the entry is a rising or falling edge.
@@ -19,7 +19,18 @@
 #define MILLIS_MULTIPLIER 1
 #define MAX_COUNTER (MILLIS_MULTIPLIER * 8400000)
 
-class IrReceiver
+int OotcPulseStartTime; // this should be the same for all sensors.
+
+/*
+enum LighthouseState
+{
+  LHS_LOOKING_FOR_OOTC = 0;
+  LHS_LOOKING_FOR_PULSES = 1;
+};
+*/
+
+
+class RingBuff
 {
   public:
   short readerPos; // last place read from
@@ -29,36 +40,60 @@ class IrReceiver
   // ring buffer is as simple as possible in the interrupt routine
   // i.e. all it has to do is a quick comparison to see if it's safe to write.
   unsigned int buff[RINGBUFF_MAX];
-  
+
+  RingBuff()
+  {
+    readerPos=0;
+    writerPos=1;
+  }
+};
+
+static volatile RingBuff ringBuff;
+
+struct OotcPulseInfo
+{
+  int startTime;
   bool data;
   bool rotor;
   bool skip;
 
-  bool lastPulseWasOotc;
-  bool lastWasRising;
-  int OotcPulseStartTime;
+  OotcPulseInfo()
+  {
+    startTime=0;
+    data=false;
+    rotor=false;
+    skip=false;
+  }
+};
+
+OotcPulseInfo OotcInfo;
+
+class IrReceiver
+{
+  public:
+  
+
+  bool isAsserted;
+  int lastRiseTime;
+//  int lastDuration;
 
   float X,Y;
 
   IrReceiver()
   {
-    readerPos=0;
-    writerPos=1;
     X=0;
     Y=0;
-    data=false;
-    rotor=false;
-    skip=false;
-    lastPulseWasOotc = false;
-    lastWasRising = false;
-    OotcPulseStartTime=0;
+    isAsserted = false;
+    lastRiseTime=0;
+//    lastDuration = 0;
     
   }  
   
 };
 
-#define MAX_RING_BUFFERS 10
-volatile IrReceiver gReceiver[MAX_RING_BUFFERS];
+#define MAX_RECEIVERS 7
+IrReceiver gReceiver[MAX_RECEIVERS];
+
 
 long int down=0, up=0;
 // the setup function runs once when you press reset or power the board
@@ -84,6 +119,11 @@ void setup()
   Serial.print("SysTick->LOAD: ");
   Serial.println(SysTick->LOAD);
 
+  // BEWARE!!!  The following line changes the working of the Arduino's inner clock.
+  // Specifically, it will make it run 100X slower.  So, if you call "delay(10)" you
+  // will instead delay by a full second instead of 10 milliseconds.
+  // This is needed in order to do the high precision timing needed to capture
+  // the pulses from the lighthouse.  
   SysTick->LOAD = 8399999;
 
   Serial.print("SysTick->LOAD: ");
@@ -110,23 +150,223 @@ void setup()
 void loop() 
 {
 
-  delay (1);  
+//  delay (1);  
+  //delayMicroseconds(10);
+
+//  ProcessSensor(0);
+//  ProcessSensor(1);
+//  ProcessSensor(2);
+//  ProcessSensor(3);
+//  ProcessSensor(4);
+//  ProcessSensor(5);
+
+  ProcessRingBuff();
+}
 
 
-  ProcessSensor(0);
-  ProcessSensor(1);
-  ProcessSensor(2);
-  ProcessSensor(3);
-  ProcessSensor(4);
-  ProcessSensor(5);
+void ProcessRingBuff()
+{
+  // yeah, this is a hairy conditional.  
+  // We're checking to see if there's anything in the ring buffer for us to process.
+  // We've traded off some complexity here to make the interrupt routines simpler/ faster 
+  while (((ringBuff.writerPos - 1 - ringBuff.readerPos) + RINGBUFF_MAX) % RINGBUFF_MAX != 0)
+  {
+    ringBuff.readerPos = (ringBuff.readerPos+1) % RINGBUFF_MAX;
+    
+    bool isFalling = false;
 
+    // assign a reference.  No need to copy to a temp value.
+    volatile unsigned int &rawVal = ringBuff.buff[ringBuff.readerPos];
+
+    if (FALLING_EDGE & rawVal)
+    {
+      isFalling = true;
+    }
+
+    // this line limits us to 128 sensors.
+    int sensor = (rawVal >>24) & 0x7F;
+
+    unsigned int val = rawVal & 0x00FFFFFF;
+
+    if (sensor >= MAX_RECEIVERS)
+    {
+      // this should NEVER happen.
+      Serial.print("Invalid Sensor Number!!!");
+      continue;
+    }
+
+    if (!isFalling)
+    {
+      // rising
+      gReceiver[sensor].lastRiseTime = val;
+
+      #define CLOCK_CYCLES_PER_ROTATION  1400000
+//      #define MAX_CLOCK_CYCLES_PER_SWEEP (CLOCK_CYCLES_PER_ROTATION / 2)
+      // the value below represents 170 degrees.  If we allow 180 degrees, we get hit with the
+      // next sync pulse for the other laser and we erroniously consider it a laser sweep.
+      #define MAX_CLOCK_CYCLES_PER_SWEEP (CLOCK_CYCLES_PER_ROTATION * 170 / 360)
+      #define DEGREES_PER_ROTATION 360
+
+      int duration = (OotcInfo.startTime + MAX_COUNTER - val)%MAX_COUNTER;
+      // if this looks like a pulse from a sweeping laser 
+      if (duration < MAX_CLOCK_CYCLES_PER_SWEEP)
+      {
+        // hey, it looks like we see a laser sweeping.  Cool!
+
+        //TODO: remove magic number.
+        float angle = duration * 0.000257143;
+
+        if (OotcInfo.rotor)
+        {
+            gReceiver[sensor].Y = angle;      
+        }
+        else
+        {
+            gReceiver[sensor].X = angle;      
+        }
+
+        // TODO: put a last update timestamp on as well.
+        
+      }
+    }
+    else
+    {
+      // falling
+      int duration = (gReceiver[sensor].lastRiseTime + MAX_COUNTER - val) % MAX_COUNTER;  
+
+      #define TICKS_PER_OOTC_CHANNEL 875
+      #define BASE_OOTC_TICKS 4812
+      #define MAX_OOTC_TICKS (8 * TICKS_PER_OOTC_CHANNEL + BASE_OOTC_TICKS)
+
+      // if this looks like an OOTC pulse...
+      if (duration >= BASE_OOTC_TICKS && duration < MAX_OOTC_TICKS)
+      {
+        OotcInfo.startTime = gReceiver[sensor].lastRiseTime;
+        
+        // we have an OOTC pulse.  
+        // for best accuracy, let's go figure out which sensor saw the beginning of the 
+        // pulse first.  It's effectively random which interrupt would have fired first
+        // so we want to find which one it was.  
+        for (int i=0; i < MAX_RECEIVERS; i++)
+        {
+          int tempDuration = (gReceiver[i].lastRiseTime + MAX_COUNTER - val) % MAX_COUNTER;  
+
+          if (tempDuration > MAX_OOTC_TICKS)
+          {
+            continue;
+          }
+          if (tempDuration < BASE_OOTC_TICKS)
+          {
+            // that's odd, wouldn't expect to see this very often
+            // only case I can think of would be if all of the sensors have been unable
+            // to see the OOTC pulses for a while, then you come back. i.e. leaving room and coming back.
+            // and even then, this would only only happen rarely because you'd have to come back
+            // very close to a multiple of MAX_COUNTER ticks.  Specifically, if you left
+            // and came back, you'd only see this 100*(MAX_OOTC_TICKS - BASE_OOTC_TICKS)/MAX_COUNTER percent of the time.  That's rare.
+            Serial.println("OOTC time underflow");
+            continue;
+          }
+          // the longest duration will indicate the earliest start time.
+          // this should be from whichever sensor triggered the first interrupt
+          // that's the one we care about because it will be the most accurate.
+          if (tempDuration > duration)
+          {
+            duration = tempDuration;
+            OotcInfo.startTime = gReceiver[sensor].lastRiseTime;           
+          }
+        }
+
+        // okay, now we have a quality OOTC start time and duration.  
+        // first, let's poison the start times.  That way, we won't do the above check
+        // again for the same OOTC pulse.  We'll poison the start times by makeing sure they're
+        // showing as old enough that the next sensor that registers a pulse will see it being
+        // too long/ old for the pulse to be an OOTC pulse, and it will throw it away.
+        // since we only poison after the first falling edge is detected, we will ensure
+        // that the first falling edge detected for the OOTC pulse from any sensor 
+        // (which is going to be the most accurate time of the pulse) will be the only
+        // falling edge we look at.  Combined with logic in the code above, this means
+        // that for an OOTC pulse, we'll always look at the most accurate start time
+        // received from any sensor, and the most accurate pulse end time received
+        // from any sensor, even if they're from different sensors.
+
+        // okay, let's poison.
+        unsigned int poisonValue = (val + MAX_COUNTER - MAX_OOTC_TICKS - 10) % MAX_COUNTER; 
+        //I think doing a "- 1" above would be sufficient, but doing a "-10" just to avoid any possible off-by-1 errors.
+
+        for (int i=0; i < MAX_RECEIVERS; i++)
+        {
+          gReceiver[i].lastRiseTime = poisonValue;
+        }        
+
+        
+        // Now we need to decode the OOTC pulse;
+        unsigned int decodedPulseVal = (duration - BASE_OOTC_TICKS) / TICKS_PER_OOTC_CHANNEL;
+
+        OotcInfo.rotor = decodedPulseVal & 0x01;
+        OotcInfo.data =  decodedPulseVal & 0x02;
+        OotcInfo.skip =  decodedPulseVal & 0x04;
+#if 0
+        Serial.print((ringBuff.writerPos + RINGBUFF_MAX - ringBuff.readerPos) % RINGBUFF_MAX);
+        Serial.print(" ");
+        Serial.print(OotcInfo.rotor);
+        Serial.print(" ");
+        Serial.print(OotcInfo.data);
+        Serial.print(" ");
+        Serial.println(OotcInfo.skip);
+
+#endif        
+
+#if 1
+static int jumpCounter=0;
+jumpCounter++;
+if (jumpCounter %10 == 0)
+{
+        Serial.print((ringBuff.writerPos + RINGBUFF_MAX - ringBuff.readerPos) % RINGBUFF_MAX);
+        Serial.print(" ");
+
+        for (int i=0; i < 6 /*MAX_RECEIVERS*/; i++)
+        {
+          Serial.print(i);
+          Serial.print(":(");
+          Serial.print(gReceiver[i].X);
+          Serial.print(",");
+          Serial.print(gReceiver[i].Y);
+          Serial.print(") ");      
+        }
+        
+        Serial.println("");
+}
+#endif
+
+        // TODO: ProcessOotcBit(gReceiver[sensor].data);        
+      }
+          ////////////////////////
+    }
+
+static int counter = 0;
+counter++;
+if (counter % 100 == 0 & false)
+{
+    Serial.print((ringBuff.writerPos + RINGBUFF_MAX - ringBuff.readerPos) % RINGBUFF_MAX);
+    Serial.print(" ");
+    Serial.print(isFalling);
+    Serial.print(" ");
+    Serial.print(sensor);
+    Serial.print(" ");
+    Serial.println(val);
+}
+    
+  
+  }
 }
 
 void ProcessSensor(int sensor)
 {
-           
+#if 0 // disable this whole function.
+Serial.print("******** ");           
+Serial.println(sensor);
 
-  int lastTime = 0;
+int i=0;
   // yeah, this is a hairy conditional.  
   // We're checking to see if there's anything in the ring buffer for us to process.
   // We've traded off some complexity here to make the interrupt routines simpler/ faster
@@ -134,249 +374,63 @@ void ProcessSensor(int sensor)
   {
     gReceiver[sensor].readerPos = (gReceiver[sensor].readerPos+1) % RINGBUFF_MAX;
     
-    if (gReceiver[sensor].buff[gReceiver[sensor].readerPos] & FALLING_EDGE)
-    {
-#ifdef DISPLAY_SIGNAL_TIMINGS      
-      Serial.print("F ");
-//      Serial.print("Falling ");
-      Serial.print(gReceiver[sensor].buff[gReceiver[sensor].readerPos] & ~FALLING_EDGE);
-//      Serial.print(gReceiver[sensor].buff[gReceiver[sensor].readerPos] & ~FALLING_EDGE);
-      Serial.print(" ");
-#endif
-      if (gReceiver[sensor].lastWasRising)
-      {
-        int durationTicks = ((lastTime - (gReceiver[sensor].buff[gReceiver[sensor].readerPos] & ~FALLING_EDGE))+ MAX_COUNTER)%MAX_COUNTER;
-        float duration = durationTicks / 84.0; //the clock we're using has 84 ticks per us
-#ifdef DISPLAY_RAW_SIGNAL_DURATIONS         
-//        Serial.print(", ");
-        Serial.print(duration);
-      
-        Serial.print(" us ");
-#endif
+    unsigned long val = gReceiver[sensor].buff[gReceiver[sensor].readerPos];
+
+    val = val | (sensor<<24);
+
+    //Serial.write("\n");
+    char nullChar = 0;
+Serial.print(gReceiver[sensor].writerPos);
+Serial.print(" ");
+Serial.print(gReceiver[sensor].readerPos);
+//Serial.print(i++);
+Serial.print("\n");
+    
+//    Serial.print((val >> 28) & 0xF , HEX);
+//    Serial.print((val >> 24) & 0xF , HEX);
+//    Serial.print((val >> 20) & 0xF , HEX);
+//    Serial.print((val >> 16) & 0xF , HEX);
+//    Serial.print((val >> 12) & 0xF , HEX);
+//    Serial.print((val >> 8) & 0xF , HEX);
+//    Serial.print((val >> 4) & 0xF , HEX);
+//    Serial.print((val >> 0) & 0xF , HEX);
+//    Serial.print('\n');
 
 
+//    Serial.write(&((char*)val)[0],(size_t)1);
+//    Serial.write(&((char*)val)[1],(size_t)1);
+//    Serial.write(&((char*)val)[2],(size_t)1);
+//    Serial.write(&((char*)val)[3],(size_t)1);
+//    Serial.write(&nullChar, (size_t)1);
+    
 
-        // 10.416667 is a bit of a magic number  
-        // Derived from data at: 
-        // https://github.com/nairol/LighthouseRedox/blob/master/docs/Light%20Emissions.md
-        float durationDecoded = duration / 10.41667; 
+//    Serial.println(val);
 
-        
-        if (durationDecoded > 5.5 && durationDecoded < 14.5)
-        {
-          
-#ifdef DISPLAY_OOTC_RAW_TIME
-           Serial.print(durationTicks);
-           Serial.print("  ");
-//           Serial.print(durationTicks);
-//           Serial.print("  ");
-#endif
-            gReceiver[sensor].OotcPulseStartTime = lastTime;
-           // okay, looks like a OOTX frame, let's decode it
-           int pulseVal = (durationDecoded + 0.5); // add .5 so we round to the nearest instead of truncating
-           pulseVal -= 6; // subtract 6 because the first value (0 index) starts at a pulse value of 6
-
-           gReceiver[sensor].rotor = pulseVal & 0x01;
-           gReceiver[sensor].data =  pulseVal & 0x02;
-           gReceiver[sensor].skip =  pulseVal & 0x04;
-
-           ProcessOotcBit(gReceiver[sensor].data);
-
-#ifdef DISPLAY_OOTC
-           Serial.print("  data: ");
-           Serial.print(data);
-           Serial.print("  rotor: ");
-           Serial.print(rotor);
-           Serial.print("  skip: ");
-           Serial.println(skip);
-#endif
-
-           gReceiver[sensor].lastPulseWasOotc = true;
-        }
-
-        
-      }
-
-      lastTime = gReceiver[sensor].buff[gReceiver[sensor].readerPos] & ~FALLING_EDGE;
-      gReceiver[sensor].lastWasRising=false;
-      
-    }
-    else
-    {
-#ifdef DISPLAY_SIGNAL_TIMINGS      
-      Serial.print("R ");
-//      Serial.print("Rising  ");
-      Serial.print(gReceiver[sensor].buff[gReceiver[sensor].readerPos]);
-      Serial.print("  ");
-#endif
-
-      if (0)//(!lastWasRising)
-      {
-        Serial.print("               ");
-        Serial.println(lastTime - (gReceiver[sensor].buff[gReceiver[sensor].readerPos] & ~FALLING_EDGE));
-      }
-
-      lastTime = gReceiver[sensor].buff[gReceiver[sensor].readerPos];
-      gReceiver[sensor].lastWasRising=true;
-
-      if (gReceiver[sensor].lastPulseWasOotc)
-      {
-          // This is the rising edge of our sweep pulse
-          int durationTicks = ((gReceiver[sensor].OotcPulseStartTime - (gReceiver[sensor].buff[gReceiver[sensor].readerPos]))+ MAX_COUNTER)%MAX_COUNTER;
-          float duration = durationTicks / 84.0;
-
-#ifdef DISPLAY_ANGULAR_DURATIONS          
-          Serial.print(" ad:");
-          Serial.print(durationTicks);
-          Serial.print(" ");
-#endif
-
-#define CYCLES_PER_SECOND 60.0
-#define DEGREES_PER_CYCLE 360.0
-#define S_PER_MS (1.0/1000.0)
-#define CYCLES_PER_SECOND (1.0/60.0)
-
-// durationTicks is in units of 1/84,000,000 s
-          OnNewAngle(sensor,gReceiver[sensor].rotor, durationTicks * 0.000257143);
-
-// TODO: Why does the below not give the same results as above.  Must be some rounding or something?  figure it out later...
-//          OnNewAngle(0,rotor, (float)durationTicks / 84000000.0 * CYCLES_PER_SECOND * DEGREES_PER_CYCLE);
-
-
-//          OnNewAngle(0,rotor, duration * S_PER_MS * CYCLES_PER_SECOND * DEGREES_PER_CYCLE);
-       
-          gReceiver[sensor].lastPulseWasOotc = false;
-      }
-
-      
-    }
+    
+    
   }
+#endif  
 }
 
 
 
-void OnNewAngle(int irReceiver, bool rotor, float angle)
-{
-#ifdef DISPLAY_RAW_ANGLE
-  Serial.print(irReceiver);
-  Serial.print(".");
-  if (rotor)
-  {
-    Serial.print("Y:");
-  }
-  else
-  {
-    Serial.print("X:");
-  }
-  Serial.print(angle,3);
-  Serial.print("  ");
-#endif
-
-#ifdef DISPLAY_NEWLINE_AFTER_Y
-  if (rotor && irReceiver == 5)
-  {
-    Serial.println("");
-  }
-#endif
-
-  if (rotor)
-  {
-    gReceiver[irReceiver].Y = angle;
-  }
-  else
-  {
-    gReceiver[irReceiver].X = angle;
-  }
-#ifdef DISPLAY_ANGLES
-//          Serial.print(angle);
-if (rotor && irReceiver==5)
-{
-  for (int a=0; a<6; a++)
-  {
-    Serial.print(a);
-    Serial.print(".X:");
-    Serial.print(gReceiver[a].X,3);
-    Serial.print(" ");
-    Serial.print(a);
-    Serial.print(".Y:");
-    Serial.print(gReceiver[a].Y,3);
-    Serial.print("   ");
-  }
-  Serial.println("");
-}
-#endif 
-}
-
-void ProcessOotcBit(bool ootcBit)
-{
-#ifdef DISPLAY_OOTC_DATA
-  static int zeroBitCount = 0;
-  
-  Serial.print(ootcBit);
-  
-  if (zeroBitCount == 17 && ootcBit == 1)
-  {
-    Serial.println("");
-  }
-  
-  if (ootcBit == 1)
-  {
-    zeroBitCount = 0;
-  }
-  else
-  {
-    zeroBitCount++;
-  }
-#endif
-}
-
-// note: if it's ever found that we're spending too long in the interrupt service routines, we can simplify
-// these quite a bit by eliminating the call to millis() and instead raising the value of SysTick->LOAD
-// The reason we're using millis() here is that if we change SysTick->LOAD, that will change
-// other timing calculations done by the Arduino code.  
-void rising0_OLD()
-{
-  if (gReceiver[0].readerPos != gReceiver[0].writerPos)
-  {
-//    gReceiver[0].buff[gReceiver[0].writerPos] = SysTick->VAL;
-    gReceiver[0].buff[gReceiver[0].writerPos] = SysTick->VAL  + ((10000-(millis()%10000)) * 84000);
-
-    // increment the writer pos and use modulo to wrap back to the beginning
-    // of the ring buffer iff we're past the end of the buffer.
-    gReceiver[0].writerPos = (gReceiver[0].writerPos+1) % RINGBUFF_MAX;
-  }
-}
-
-void falling0_OLD()
-{
-  if (gReceiver[0].readerPos != gReceiver[0].writerPos)
-  {
-    // tack on the FALLING_EDGE bit to indicate this is a falling edge.
-//    gReceiver[0].buff[gReceiver[0].writerPos] = SysTick->VAL | FALLING_EDGE;
-    gReceiver[0].buff[gReceiver[0].writerPos] = (SysTick->VAL + ((10000-(millis()%10000)) * 84000)) | FALLING_EDGE;
-
-    // increment the writer pos and use modulo to wrap back to the beginning
-    // of the ring buffer iff we're past the end of the buffer.
-    gReceiver[0].writerPos = (gReceiver[0].writerPos+1) % RINGBUFF_MAX;
-  }
-}
 
 //    gReceiver[receiver].buff[gReceiver[receiver].writerPos] = SysTick->VAL  + ((10000-(millis()%10000)) * 84000);\
 
 #define RISING_INTERRUPT_BODY(receiver) \
-  if (gReceiver[receiver].readerPos != gReceiver[receiver].writerPos)\
+  if (ringBuff.readerPos != ringBuff.writerPos)\
   {\
-    gReceiver[receiver].buff[gReceiver[receiver].writerPos] = SysTick->VAL;\
-    gReceiver[receiver].writerPos = (gReceiver[receiver].writerPos+1) % RINGBUFF_MAX;\
+    ringBuff.buff[ringBuff.writerPos] = SysTick->VAL | (receiver<<24);\
+    ringBuff.writerPos = (ringBuff.writerPos+1) % RINGBUFF_MAX;\
   }
 
 //    gReceiver[receiver].buff[gReceiver[receiver].writerPos] = (SysTick->VAL + ((10000-(millis()%10000)) * 84000)) | FALLING_EDGE;\
 
 #define FALLING_INTERRUPT_BODY(receiver)\
-  if (gReceiver[receiver].readerPos != gReceiver[receiver].writerPos)\
+  if (ringBuff.readerPos != ringBuff.writerPos)\
   {\
-    gReceiver[receiver].buff[gReceiver[receiver].writerPos] = (SysTick->VAL) | FALLING_EDGE;\
-    gReceiver[receiver].writerPos = (gReceiver[receiver].writerPos+1) % RINGBUFF_MAX;\
+    ringBuff.buff[ringBuff.writerPos] = (SysTick->VAL) | FALLING_EDGE | (receiver<<24);\
+    ringBuff.writerPos = (ringBuff.writerPos+1) % RINGBUFF_MAX;\
   }
 
 void rising0()
