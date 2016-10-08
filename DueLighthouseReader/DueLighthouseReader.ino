@@ -8,7 +8,12 @@
 //#define DISPLAY_RAW_SIGNAL_DURATIONS
 //#define DISPLAY_NEWLINE_AFTER_Y
 
-#define RINGBUFF_MAX 1000
+
+#define RINGBUFF_LEN 0x100 // MUST be a power of 2 because of optimzations that replace modulo with bitwise AND
+#define RINGBUFF_MODULO_MASK (RINGBUFF_LEN -1)
+// For example, the two following lines are equivalent:
+//  Val % RINGBUFF_LEN
+//  Val & RINGBUFF_MODULO_MASK
 #define TICKS_PER_US 84 //84 ticks per microsecond
 
 // the high order bit is used to indicate if the entry is a rising or falling edge.
@@ -39,7 +44,7 @@ class RingBuff
   // the ring buffer is full.  We do this so that the check for a full
   // ring buffer is as simple as possible in the interrupt routine
   // i.e. all it has to do is a quick comparison to see if it's safe to write.
-  unsigned int buff[RINGBUFF_MAX];
+  volatile unsigned int buff[RINGBUFF_LEN];
 
   RingBuff()
   {
@@ -48,7 +53,8 @@ class RingBuff
   }
 };
 
-static volatile RingBuff ringBuff;
+
+static RingBuff ringBuff;
 
 struct OotcPulseInfo
 {
@@ -166,12 +172,12 @@ void loop()
 
 void ProcessRingBuff()
 {
-  // yeah, this is a hairy conditional.  
-  // We're checking to see if there's anything in the ring buffer for us to process.
-  // We've traded off some complexity here to make the interrupt routines simpler/ faster 
-  while (((ringBuff.writerPos - 1 - ringBuff.readerPos) + RINGBUFF_MAX) % RINGBUFF_MAX != 0)
+  
+  while ((((ringBuff.writerPos - 1 - ringBuff.readerPos) + RINGBUFF_LEN) & RINGBUFF_MODULO_MASK) != 0)
   {
-    ringBuff.readerPos = (ringBuff.readerPos+1) % RINGBUFF_MAX;
+
+    
+    ringBuff.readerPos = (ringBuff.readerPos+1) & RINGBUFF_MODULO_MASK;
     
     bool isFalling = false;
 
@@ -321,7 +327,8 @@ static int jumpCounter=0;
 jumpCounter++;
 if (jumpCounter %10 == 0)
 {
-        Serial.print((ringBuff.writerPos + RINGBUFF_MAX - ringBuff.readerPos) % RINGBUFF_MAX);
+        Serial.print((ringBuff.writerPos + RINGBUFF_LEN - ringBuff.readerPos) & RINGBUFF_MODULO_MASK);
+//        Serial.print((ringBuff.writerPos + RINGBUFF_MAX - ringBuff.readerPos) & RINGBUFF_MODULO_MASK);
         Serial.print(" ");
 
         for (int i=0; i < 6 /*MAX_RECEIVERS*/; i++)
@@ -347,7 +354,7 @@ static int counter = 0;
 counter++;
 if (counter % 100 == 0 & false)
 {
-    Serial.print((ringBuff.writerPos + RINGBUFF_MAX - ringBuff.readerPos) % RINGBUFF_MAX);
+    Serial.print((ringBuff.writerPos + RINGBUFF_LEN - ringBuff.readerPos) & RINGBUFF_MODULO_MASK);
     Serial.print(" ");
     Serial.print(isFalling);
     Serial.print(" ");
@@ -360,57 +367,6 @@ if (counter % 100 == 0 & false)
   }
 }
 
-void ProcessSensor(int sensor)
-{
-#if 0 // disable this whole function.
-Serial.print("******** ");           
-Serial.println(sensor);
-
-int i=0;
-  // yeah, this is a hairy conditional.  
-  // We're checking to see if there's anything in the ring buffer for us to process.
-  // We've traded off some complexity here to make the interrupt routines simpler/ faster
-  while (((gReceiver[sensor].writerPos - 1 - gReceiver[sensor].readerPos) + RINGBUFF_MAX) % RINGBUFF_MAX != 0)
-  {
-    gReceiver[sensor].readerPos = (gReceiver[sensor].readerPos+1) % RINGBUFF_MAX;
-    
-    unsigned long val = gReceiver[sensor].buff[gReceiver[sensor].readerPos];
-
-    val = val | (sensor<<24);
-
-    //Serial.write("\n");
-    char nullChar = 0;
-Serial.print(gReceiver[sensor].writerPos);
-Serial.print(" ");
-Serial.print(gReceiver[sensor].readerPos);
-//Serial.print(i++);
-Serial.print("\n");
-    
-//    Serial.print((val >> 28) & 0xF , HEX);
-//    Serial.print((val >> 24) & 0xF , HEX);
-//    Serial.print((val >> 20) & 0xF , HEX);
-//    Serial.print((val >> 16) & 0xF , HEX);
-//    Serial.print((val >> 12) & 0xF , HEX);
-//    Serial.print((val >> 8) & 0xF , HEX);
-//    Serial.print((val >> 4) & 0xF , HEX);
-//    Serial.print((val >> 0) & 0xF , HEX);
-//    Serial.print('\n');
-
-
-//    Serial.write(&((char*)val)[0],(size_t)1);
-//    Serial.write(&((char*)val)[1],(size_t)1);
-//    Serial.write(&((char*)val)[2],(size_t)1);
-//    Serial.write(&((char*)val)[3],(size_t)1);
-//    Serial.write(&nullChar, (size_t)1);
-    
-
-//    Serial.println(val);
-
-    
-    
-  }
-#endif  
-}
 
 
 
@@ -421,7 +377,7 @@ Serial.print("\n");
   if (ringBuff.readerPos != ringBuff.writerPos)\
   {\
     ringBuff.buff[ringBuff.writerPos] = SysTick->VAL | (receiver<<24);\
-    ringBuff.writerPos = (ringBuff.writerPos+1) % RINGBUFF_MAX;\
+    ringBuff.writerPos = (ringBuff.writerPos+1) & RINGBUFF_MODULO_MASK;\
   }
 
 //    gReceiver[receiver].buff[gReceiver[receiver].writerPos] = (SysTick->VAL + ((10000-(millis()%10000)) * 84000)) | FALLING_EDGE;\
@@ -430,7 +386,7 @@ Serial.print("\n");
   if (ringBuff.readerPos != ringBuff.writerPos)\
   {\
     ringBuff.buff[ringBuff.writerPos] = (SysTick->VAL) | FALLING_EDGE | (receiver<<24);\
-    ringBuff.writerPos = (ringBuff.writerPos+1) % RINGBUFF_MAX;\
+    ringBuff.writerPos = (ringBuff.writerPos+1) & RINGBUFF_MODULO_MASK;\
   }
 
 void rising0()
